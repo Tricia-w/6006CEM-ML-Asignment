@@ -1,0 +1,328 @@
+# ===== Modeling: Preprocessing + Decision Tree + FNN + Hybrid (Blending) =====
+# Uses the SAME target detection and column typing as the EDA script.
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# Silence TF logging + typical retracing spam
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+
+from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, LabelEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (
+    accuracy_score, classification_report, ConfusionMatrixDisplay, f1_score, roc_auc_score
+)
+from sklearn.tree import DecisionTreeClassifier, plot_tree
+
+import tensorflow as tf
+tf.get_logger().setLevel("ERROR")   # reduce python-level TF warnings
+
+from tensorflow.keras import Sequential
+from tensorflow.keras.layers import Dense, Dropout, Input
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras import backend as K
+
+# 1) Load (same dataset)
+CSV_PATH = r"C:\Data\student_classification_dataset.csv"
+df = pd.read_csv(CSV_PATH).reset_index(drop=True)
+
+# ===== Feature Engineering for Student Classification Dataset =====
+# Adds custom numeric features to enrich model input.
+
+# 1. study_efficiency 
+if "Attendance" in df.columns and "Weekly_Study_Hours" in df.columns:
+    attendance_map = {"Always": 1.0, "Sometimes": 0.5, "Never": 0.0}
+    df["attendance_score"] = df["Attendance"].map(attendance_map)
+    df["study_efficiency"] = df["Weekly_Study_Hours"] * df["attendance_score"]
+
+# 2. engagement_score 
+engagement_cols = ["Reading", "Notes", "Listening_in_Class", "Project_work"]
+for col in engagement_cols:
+    if col in df.columns:
+        df[col + "_bin"] = df[col].map({"Yes": 1, "No": 0})
+
+available_bins = [c + "_bin" for c in engagement_cols if c + "_bin" in df.columns]
+if available_bins:
+    df["engagement_score"] = df[available_bins].sum(axis=1)
+
+# 3. activity_balance 
+if "Sports_activity" in df.columns and "Additional_Work" in df.columns:
+    df["activity_balance"] = (
+        df["Sports_activity"].map({"Yes": 1, "No": 0}) -
+        df["Additional_Work"].map({"Yes": 1, "No": 0})
+    )
+
+# 4. travel_study_ratio
+if "Transportation" in df.columns and "Weekly_Study_Hours" in df.columns:
+    transport_map = {"Private": 1.0, "Public": 0.5, "Other": 0.8}
+    df["travel_study_ratio"] = df["Weekly_Study_Hours"] * df["Transportation"].map(transport_map)
+
+# Display confirmation
+new_feats = [c for c in ["study_efficiency", "engagement_score", "activity_balance", "travel_study_ratio"] if c in df.columns]
+print("\nNew engineered features added:", new_feats)
+if new_feats:
+    print(df[new_feats].head())
+
+# Optional: drop obvious IDs
+for col in ["id", "student_id", "index"]:
+    if col in df.columns:
+        df.drop(columns=col, inplace=True)
+
+# 2) Target detection (identical to EDA)
+possible_targets = ["performance_category", "class", "target", "label", "grade_category", "performance"]
+target = next((c for c in possible_targets if c in df.columns), None)
+if target is None:
+    nonnum = [c for c in df.columns if df[c].dtype == "object"]
+    target = nonnum[-1] if nonnum else df.columns[-1]
+print("Target column:", target)
+
+# 3) Types (EXACT match with EDA)
+numeric_cols = [c for c in df.select_dtypes(include=[np.number]).columns if c != target]
+categorical_cols = [c for c in df.columns if c not in numeric_cols + [target]]
+print("Numeric cols:", numeric_cols)
+print("Categorical cols:", categorical_cols)
+
+# 4) Split X/y
+X = df.drop(columns=[target])
+y_raw = df[target]
+lbl = LabelEncoder()
+y = lbl.fit_transform(y_raw)
+class_names = [str(c) for c in lbl.classes_]
+n_classes = len(class_names)
+
+# Train/Val/Test
+X_train_full, X_test, y_train_full, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+X_train, X_val, y_train, y_val = train_test_split(
+    X_train_full, y_train_full, test_size=0.2, random_state=42, stratify=y_train_full
+)
+
+# 5) Preprocessing — SAME rules as EDA
+try:
+    ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)  # sklearn >=1.2
+except TypeError:
+    ohe = OneHotEncoder(handle_unknown="ignore", sparse=False)         # older sklearn
+
+num_pipe = Pipeline([
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler())
+])
+cat_pipe = Pipeline([
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("onehot", ohe)
+])
+
+preproc = ColumnTransformer([
+    ("num", num_pipe, numeric_cols),
+    ("cat", cat_pipe, categorical_cols)
+], remainder="drop")
+
+# Fit on training; transform sets
+X_train_t = preproc.fit_transform(X_train)
+X_val_t   = preproc.transform(X_val)
+X_test_t  = preproc.transform(X_test)
+
+# Helper: feature names for diagrams/importance
+def get_feature_names(ct: ColumnTransformer) -> list:
+    names = []
+    for name, trans, cols in ct.transformers_:
+        if name == "remainder":
+            continue
+        if hasattr(trans, "named_steps"):
+            oh = trans.named_steps.get("onehot", None)
+            if oh is not None and hasattr(oh, "get_feature_names_out"):
+                names.extend(list(oh.get_feature_names_out(cols)))
+            else:
+                names.extend(list(cols))
+        else:
+            names.extend(list(cols))
+    return names
+
+try:
+    feature_names = np.array(get_feature_names(preproc))
+except Exception:
+    feature_names = np.array([f"f_{i}" for i in range(X_train_t.shape[1])])
+
+# 6) Decision Tree — (A) compact diagram, (B) tuned model
+dt_compact = DecisionTreeClassifier(random_state=42, max_depth=4, min_samples_leaf=2)
+dt_compact.fit(X_train_t, y_train)
+
+plt.figure(figsize=(24, 14))
+plot_tree(
+    dt_compact,
+    feature_names=feature_names,
+    class_names=class_names,
+    filled=True, rounded=True, fontsize=9, impurity=True
+)
+plt.title("Decision Tree Diagram (Compact depth=4)")
+plt.tight_layout()
+plt.savefig("decision_tree_diagram.png", dpi=220)
+plt.show()
+print("Saved: decision_tree_diagram.png")
+
+# (B) Tuned DT for performance
+dt_pipe = Pipeline([
+    ("pre", preproc),
+    ("dt", DecisionTreeClassifier(random_state=42))
+])
+
+param_grid_dt = {
+    "dt__max_depth": [None, 3, 5, 8, 12, 16],
+    "dt__min_samples_split": [2, 5, 10, 20],
+    "dt__min_samples_leaf": [1, 2, 4, 8],
+    "dt__class_weight": [None, "balanced"]
+}
+
+counts = np.bincount(y_train)
+safe_splits = int(max(2, min(5, counts.min())))  # avoid tiny-class CV errors
+cv = StratifiedKFold(n_splits=safe_splits, shuffle=True, random_state=42)
+
+gs_dt = GridSearchCV(dt_pipe, param_grid_dt, scoring="f1_macro", cv=cv, n_jobs=-1, verbose=0)
+gs_dt.fit(X_train, y_train)
+best_dt = gs_dt.best_estimator_
+print("Best DT params:", gs_dt.best_params_, "| CV macro-F1:", round(gs_dt.best_score_, 4))
+
+# DT predictions & probs
+dt_val_proba  = best_dt.predict_proba(X_val)
+dt_test_proba = best_dt.predict_proba(X_test)
+y_test_pred_dt = best_dt.predict(X_test)
+
+print("\nDecision Tree — Test")
+print("Accuracy:", round(accuracy_score(y_test, y_test_pred_dt), 4))
+print(classification_report(y_test, y_test_pred_dt, target_names=class_names, digits=4, zero_division=0))
+plt.figure()
+ConfusionMatrixDisplay.from_predictions(y_test, y_test_pred_dt, display_labels=class_names, xticks_rotation=45)
+plt.title("Decision Tree (Tuned) — Confusion Matrix")
+plt.tight_layout(); plt.show()
+
+# 7) FNN — tuned light search, minimized retracing, with training curves
+tf.random.set_seed(42)
+np.random.seed(42)
+
+class_weights = {i: (len(y_train)/(n_classes * max(np.sum(y_train==i),1))) for i in range(n_classes)}
+
+def build_fnn(input_dim, n_classes, width=128, depth=2, dropout=0.2, lr=1e-3):
+    m = Sequential([Input(shape=(input_dim,))])
+    for _ in range(depth):
+        m.add(Dense(width, activation="relu"))
+        if dropout > 0: m.add(Dropout(dropout))
+    m.add(Dense(n_classes, activation="softmax"))
+    m.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
+              loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+    return m
+
+search = [
+    {"width": 64,  "depth": 1, "dropout": 0.1, "lr": 1e-3},
+    {"width": 128, "depth": 2, "dropout": 0.2, "lr": 1e-3},
+    {"width": 256, "depth": 2, "dropout": 0.3, "lr": 5e-4},
+]
+
+best_model, best_cfg, best_f1 = None, None, -np.inf
+best_history = None
+early = EarlyStopping(monitor="val_loss", patience=10, mode="min", restore_best_weights=True)
+
+for cfg in search:
+    K.clear_session()
+    m = build_fnn(X_train_t.shape[1], n_classes, **cfg)
+    h = m.fit(
+        X_train_t, y_train,
+        validation_data=(X_val_t, y_val),
+        epochs=200, batch_size=32,
+        callbacks=[early], verbose=0,
+        class_weight=class_weights
+    )
+    y_val_pred = np.argmax(m.predict(X_val_t, verbose=0), axis=1)
+    f1 = f1_score(y_val, y_val_pred, average="macro")
+    if f1 > best_f1:
+        best_f1, best_cfg, best_model, best_history = f1, cfg, m, h
+
+print("Best FNN config:", best_cfg, "| Val macro-F1:", round(best_f1, 4))
+
+ann_val_proba  = best_model.predict(X_val_t, verbose=0)
+ann_test_proba = best_model.predict(X_test_t, verbose=0)
+y_test_pred_fnn = np.argmax(ann_test_proba, axis=1)
+
+print("\nFNN — Test")
+print("Accuracy:", round(accuracy_score(y_test, y_test_pred_fnn), 4))
+print(classification_report(y_test, y_test_pred_fnn, target_names=class_names, digits=4, zero_division=0))
+plt.figure()
+ConfusionMatrixDisplay.from_predictions(y_test, y_test_pred_fnn, display_labels=class_names, xticks_rotation=45)
+plt.title("FNN — Confusion Matrix")
+plt.tight_layout(); plt.show()
+
+# FNN training curves (best run)
+if best_history is not None:
+    hist = best_history.history
+    plt.figure()
+    plt.plot(hist["accuracy"], label="train_acc")
+    plt.plot(hist["val_accuracy"], label="val_acc")
+    plt.xlabel("Epoch"); plt.ylabel("Accuracy"); plt.title("FNN — Training Curve (Accuracy)")
+    plt.legend(); plt.tight_layout(); plt.show()
+
+    plt.figure()
+    plt.plot(hist["loss"], label="train_loss")
+    plt.plot(hist["val_loss"], label="val_loss")
+    plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.title("FNN — Training Curve (Loss)")
+    plt.legend(); plt.tight_layout(); plt.show()
+
+# 8) Hybrid — probability blending (alpha tuned on validation)
+alphas = np.linspace(0, 1, 101)
+best_alpha, best_f1_h = None, -np.inf
+
+for a in alphas:
+    blend_val = (1 - a) * dt_val_proba + a * ann_val_proba
+    y_val_hat = blend_val.argmax(axis=1)
+    f1 = f1_score(y_val, y_val_hat, average="macro")
+    if f1 > best_f1_h:
+        best_f1_h, best_alpha = f1, a
+
+print(f"\nHybrid — best alpha (val) = {best_alpha:.2f} | Val macro-F1 = {best_f1_h:.4f}")
+
+blend_test = (1 - best_alpha) * dt_test_proba + best_alpha * ann_test_proba
+y_test_pred_h = blend_test.argmax(axis=1)
+
+print("\nHybrid (Blending) — Test")
+print("Accuracy:", round(accuracy_score(y_test, y_test_pred_h), 4))
+print(classification_report(y_test, y_test_pred_h, target_names=class_names, digits=4, zero_division=0))
+plt.figure()
+ConfusionMatrixDisplay.from_predictions(y_test, y_test_pred_h, display_labels=class_names, xticks_rotation=45)
+plt.title(f"Hybrid (Blend α={best_alpha:.2f}) — Confusion Matrix")
+plt.tight_layout(); plt.show()
+
+# Optional: ROC-AUC
+try:
+    if n_classes == 2:
+        auc_dt  = roc_auc_score(y_test, dt_test_proba[:,1])
+        auc_ann = roc_auc_score(y_test, ann_test_proba[:,1])
+        auc_h   = roc_auc_score(y_test, blend_test[:,1])
+    else:
+        auc_dt  = roc_auc_score(y_test, dt_test_proba,  multi_class="ovr")
+        auc_ann = roc_auc_score(y_test, ann_test_proba, multi_class="ovr")
+        auc_h   = roc_auc_score(y_test, blend_test,     multi_class="ovr")
+    print(f"\nROC-AUC — DT: {auc_dt:.4f} | FNN: {auc_ann:.4f} | Hybrid: {auc_h:.4f}")
+except Exception as e:
+    print("ROC-AUC skipped:", e)
+
+# 9) Summary
+acc_dt  = accuracy_score(y_test, y_test_pred_dt)
+acc_ann = accuracy_score(y_test, y_test_pred_fnn)
+acc_h   = accuracy_score(y_test, y_test_pred_h)
+
+f1_dt   = f1_score(y_test, y_test_pred_dt,  average="macro")
+f1_ann  = f1_score(y_test, y_test_pred_fnn, average="macro")
+f1_h    = f1_score(y_test, y_test_pred_h,   average="macro")
+
+summary = pd.DataFrame({
+    "Model": ["Decision Tree (tuned)", "FNN (tuned)", f"Hybrid (α={best_alpha:.2f})"],
+    "Accuracy": [acc_dt, acc_ann, acc_h],
+    "Macro-F1": [f1_dt, f1_ann, f1_h]
+}).sort_values(["Macro-F1", "Accuracy"], ascending=False)
+
+print("\nSummary (sorted by Macro-F1 then Accuracy)")
+print(summary.to_string(index=False))
