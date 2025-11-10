@@ -1,0 +1,105 @@
+# Exploratory Data Analysis (EDA) 
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+sns.set(style="whitegrid")
+
+# 1) Config
+CSV_PATH = r"C:\Data\student_habits_performance.csv"
+TARGET = "exam_score"
+
+# 2) Load Dataset
+df = pd.read_csv(CSV_PATH)
+df = df.drop(columns=["student_id"], errors="ignore")  # Drop irrelevant ID if exists
+
+# 2b) Duplicates Check (and optional removal)
+DROP_DUPLICATES = True 
+dup_count = df.duplicated().sum()
+dup_pct = 100 * dup_count / len(df) if len(df) else 0
+print(f"\nDuplicate rows: {dup_count} ({dup_pct:.2f}%)")
+
+if DROP_DUPLICATES and dup_count > 0:
+    df_before = len(df)
+    df = df.drop_duplicates(ignore_index=True)
+    print(f"Dropped {df_before - len(df)} duplicate rows. New shape: {df.shape}")
+
+print("Shape:", df.shape)
+print("\nData Types:\n", df.dtypes)
+print("\nMissing Values:\n", df.isnull().sum())
+
+# 3) Summary Statistics
+num_df = df.select_dtypes(include=['number'])
+print("\nSummary Statistics:\n", num_df.describe().T)
+
+# 4) Correlation Heatmap (Numeric Only)
+if num_df.shape[1] >= 2:
+    plt.figure(figsize=(10, 8))
+    corr_numeric = num_df.corr()
+    sns.heatmap(corr_numeric, cmap="coolwarm", annot=True, fmt=".2f", square=True)
+    plt.title("Correlation Heatmap (Numeric Features)")
+    plt.tight_layout()
+    plt.show()
+
+# 5) One-Hot Encoded Correlation Heatmap
+# Encode categorical columns for extended correlation analysis
+df_encoded = pd.get_dummies(df, drop_first=True)
+corr_encoded = df_encoded.corr(numeric_only=True)
+
+plt.figure(figsize=(14, 10))
+sns.heatmap(corr_encoded, cmap="coolwarm", annot=False, fmt=".2f", linewidths=0.3, cbar=True)
+plt.title("Correlation Heatmap (After One-Hot Encoding)")
+plt.xticks(rotation=90)
+plt.yticks(rotation=0)
+plt.tight_layout()
+plt.show()
+
+# 6) Target Distribution
+if TARGET in df.columns:
+    plt.figure(figsize=(7, 4))
+    sns.histplot(df[TARGET].dropna(), kde=True, bins=25, color="skyblue")
+    plt.title(f"Distribution of Target: {TARGET}")
+    plt.xlabel(TARGET)
+    plt.ylabel("Count")
+    plt.tight_layout()
+    plt.show()
+
+# 7) Top Correlated Features with Target
+if TARGET in num_df.columns:
+    target_corr = num_df.corr()[TARGET].drop(TARGET).sort_values(ascending=False)
+    print("\nTop correlated numeric features with target:")
+    print(target_corr.head(5))
+    
+    top_feats = list(target_corr.head(3).index)
+    for feat in top_feats:
+        plt.figure(figsize=(6, 5))
+        sns.scatterplot(x=df[feat], y=df[TARGET], alpha=0.7)
+        plt.title(f"{feat} vs {TARGET}")
+        plt.tight_layout()
+        plt.show()
+
+# 8) Target vs Categorical Features (Boxplots)
+cat_cols = [c for c in df.columns if df[c].dtype == 'object']
+if cat_cols:
+    for c in cat_cols[:3]:  # Limit to top 3 categorical features
+        plt.figure(figsize=(7, 4))
+        sns.boxplot(x=df[c], y=df[TARGET])
+        plt.title(f"{TARGET} by {c}")
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.show()
+
+# 9) Missing Values (Bar Plot)
+missing = df.isnull().sum()
+missing = missing[missing > 0].sort_values(ascending=False)
+if not missing.empty:
+    plt.figure(figsize=(8, max(3, 0.3 * len(missing))))
+    sns.barplot(x=missing.values, y=missing.index, color="salmon")
+    plt.title("Missing Values per Column")
+    plt.xlabel("Count")
+    plt.tight_layout()
+    plt.show()
+else:
+    print("\nNo missing values detected.")
+
+print("\nEDA completed successfully — numeric & encoded heatmaps generated.")
