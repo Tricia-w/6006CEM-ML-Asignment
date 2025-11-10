@@ -1,0 +1,212 @@
+# Regression: Traditional (Ridge), Deep (ANN), Hybrid (Ridge + ANN)
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+# Deep learning
+from tensorflow.keras import Input
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+
+# 1) Config
+CSV_PATH = r"C:\Data\student_habits_performance.csv" 
+ENGINEERED_PATH = r"C:\Data\student_habits_engineered.csv"
+TARGET   = "exam_score"                
+
+RANDOM_STATE = 42
+TEST_SIZE    = 0.2
+VAL_SIZE     = 0.2
+EPOCHS       = 200
+BATCH_SIZE   = 32        
+PATIENCE     = 20
+
+# 2) Load data
+df = pd.read_csv(CSV_PATH)
+
+if TARGET not in df.columns:
+    raise ValueError(f"TARGET column '{TARGET}' not found. Columns: {list(df.columns)}")
+
+# ===== Feature Engineering Section =====
+if all(col in df.columns for col in ["social_media_hours", "netflix_hours", "study_hours_per_day", "sleep_hours", "attendance_percentage"]):
+    df["leisure_hours"] = df["social_media_hours"] + df["netflix_hours"]
+    df["study_sleep_ratio"] = df["study_hours_per_day"] / df["sleep_hours"]
+    df["sleep_deficit"] = (8 - df["sleep_hours"]).clip(lower=0)
+    df["attendance_x_study"] = df["attendance_percentage"] * df["study_hours_per_day"]
+
+    print("\n Feature engineering added successfully:")
+    print(df[["leisure_hours", "study_sleep_ratio", "sleep_deficit", "attendance_x_study"]].head())
+    df.to_csv(ENGINEERED_PATH, index=False)
+    print(f"Engineered dataset saved to: {ENGINEERED_PATH}")
+else:
+    print(" Skipping feature engineering — required columns not found in dataset.")
+
+# ======================================
+
+# Separate features/target
+y = df[TARGET].astype(float)
+X = df.drop(columns=[TARGET])
+
+# Identify feature types
+cat_cols = [c for c in X.columns if X[c].dtype == 'object' or str(X[c].dtype).startswith('category')]
+num_cols = [c for c in X.columns if c not in cat_cols]
+
+# 3) Train/Validation/Test split
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE
+)
+
+X_fit, X_val, y_fit, y_val = train_test_split(
+    X_train, y_train, test_size=VAL_SIZE, random_state=RANDOM_STATE
+)
+
+# 4) Preprocessing
+num_pipe = Pipeline(steps=[
+    ("impute", SimpleImputer(strategy="median")),
+    ("scale", StandardScaler())
+])
+
+cat_pipe = Pipeline(steps=[
+    ("impute", SimpleImputer(strategy="most_frequent")),
+    ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
+])
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("num", num_pipe, num_cols),
+        ("cat", cat_pipe, cat_cols),
+    ],
+    remainder="drop",
+    verbose_feature_names_out=False
+)
+
+preprocessor.fit(X_fit)
+
+X_fit_t = preprocessor.transform(X_fit)
+X_val_t = preprocessor.transform(X_val)
+X_train_t = preprocessor.transform(X_train)
+X_test_t = preprocessor.transform(X_test)
+input_dim = X_train_t.shape[1]
+
+# 5) Ridge Regression
+param_grid = {"alpha": [0.001, 0.01, 0.1, 1, 10, 100]}
+ridge = Ridge(max_iter=5000, random_state=RANDOM_STATE)
+grid_search = GridSearchCV(ridge, param_grid, cv=5, scoring="r2", n_jobs=-1)
+grid_search.fit(X_fit_t, y_fit)
+
+best_ridge = grid_search.best_estimator_
+print(f"Best Ridge Parameter: {grid_search.best_params_}")
+
+ridge_val_pred  = best_ridge.predict(X_val_t)
+ridge_test_pred = best_ridge.predict(X_test_t)
+
+# 6) ANN (Deep Learning)
+def build_ann(input_dim: int):
+    model = Sequential([
+        Input(shape=(input_dim,)),    # clean Input layer — avoids warning
+        Dense(128, activation="relu"),
+        Dropout(0.10),
+        Dense(64, activation="relu"),
+        Dense(32, activation="relu"),
+        Dense(1)
+    ])
+    model.compile(optimizer="adam", loss="mse", metrics=["mae"])
+    return model
+
+ann = build_ann(input_dim)
+early_stop = EarlyStopping(monitor="val_loss", patience=PATIENCE, restore_best_weights=True)
+history = ann.fit(
+    X_fit_t, y_fit,
+    validation_data=(X_val_t, y_val),
+    epochs=EPOCHS,
+    batch_size=BATCH_SIZE,
+    verbose=0,
+    callbacks=[early_stop]
+)
+
+ann_val_pred  = ann.predict(X_val_t, verbose=0).flatten()
+ann_test_pred = ann.predict(X_test_t, verbose=0).flatten()
+
+# 7) Hybrid (Ridge + ANN)
+alphas = np.linspace(0, 1, 101)
+best_alpha, best_mse = None, np.inf
+for a in alphas:
+    blend = a * ridge_val_pred + (1 - a) * ann_val_pred
+    mse = mean_squared_error(y_val, blend)
+    if mse < best_mse:
+        best_mse, best_alpha = mse, a
+
+hyb_test_pred = best_alpha * ridge_test_pred + (1 - best_alpha) * ann_test_pred
+
+# 8) Metrics
+def metrics(y_true, y_pred):
+    mae = mean_absolute_error(y_true, y_pred)
+    try:
+        rmse = mean_squared_error(y_true, y_pred, squared=False)
+    except TypeError:
+        rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    r2  = r2_score(y_true, y_pred)
+    return mae, rmse, r2
+
+ridge_mae,  ridge_rmse,  ridge_r2  = metrics(y_test, ridge_test_pred)
+ann_mae, ann_rmse, ann_r2 = metrics(y_test, ann_test_pred)
+hyb_mae, hyb_rmse, hyb_r2 = metrics(y_test, hyb_test_pred)
+
+print("\nTest Metrics")
+print(f"Ridge Regression       -> MAE: {ridge_mae:.4f} | RMSE: {ridge_rmse:.4f} | R²: {ridge_r2:.4f}")
+print(f"ANN (Deep Learning)    -> MAE: {ann_mae:.4f} | RMSE: {ann_rmse:.4f} | R²: {ann_r2:.4f}")
+print(f"Hybrid (Ridge + ANN)   -> MAE: {hyb_mae:.4f} | RMSE: {hyb_rmse:.4f} | R²: {hyb_r2:.4f}")
+print(f"Chosen alpha (weight on Ridge) for hybrid: {best_alpha:.2f}")
+
+# 9) Plots
+plt.figure(figsize=(7,5))
+plt.plot(history.history["loss"], label="train_loss")
+plt.plot(history.history["val_loss"], label="val_loss")
+plt.xlabel("Epoch")
+plt.ylabel("MSE loss")
+plt.title("ANN Training Curve")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+def parity_plot(y_true, y_pred, title):
+    plt.figure(figsize=(6.5,6))
+    plt.scatter(y_true, y_pred, alpha=0.7)
+    mn, mx = np.min(y_true), np.max(y_true)
+    plt.plot([mn, mx], [mn, mx], color="red")
+    plt.xlabel("Actual")
+    plt.ylabel("Predicted")
+    plt.title(title)
+    plt.tight_layout()
+    plt.show()
+
+def residuals_plot(y_true, y_pred, title):
+    residuals = y_true - y_pred
+    plt.figure(figsize=(7,5))
+    plt.scatter(y_pred, residuals, alpha=0.7)
+    plt.axhline(0, color='red')
+    plt.xlabel("Predicted")
+    plt.ylabel("Residual (Actual - Predicted)")
+    plt.title(title)
+    plt.tight_layout()
+    plt.show()
+
+# Plots for each model
+parity_plot(y_test, ridge_test_pred, "Parity Plot — Ridge Regression")
+residuals_plot(y_test, ridge_test_pred, "Residuals — Ridge Regression")
+
+parity_plot(y_test, ann_test_pred, "Parity Plot — ANN")
+residuals_plot(y_test, ann_test_pred, "Residuals — ANN")
+
+parity_plot(y_test, hyb_test_pred, "Parity Plot — Hybrid (Ridge + ANN)")
+residuals_plot(y_test, hyb_test_pred, "Residuals — Hybrid (Ridge + ANN)")
