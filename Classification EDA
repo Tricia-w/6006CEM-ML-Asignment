@@ -1,0 +1,112 @@
+# ===== EDA: student_classification_dataset =====
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+plt.rcParams["figure.dpi"] = 110
+
+# 1) Load
+FILE = r"C:\Data\student_classification_dataset.csv"
+df = pd.read_csv(FILE).reset_index(drop=True)
+
+# 2) Overview
+print(" Data Overview")
+print("Shape:", df.shape)
+print("\nColumns:\n", df.columns.tolist())
+print("\nData Types:\n", df.dtypes)
+print("\nMissing Values (count):\n", df.isnull().sum().sort_values(ascending=False))
+print("\nFirst 5 Rows:")
+print(df.head())
+
+# 2.1) Duplicates
+dups = df.duplicated().sum()
+print(f"\nNumber of duplicate rows: {dups}")
+if dups > 0:
+    print(df[df.duplicated()].head())
+    df = df.drop_duplicates().reset_index(drop=True)
+    print("Duplicates removed. New shape:", df.shape)
+
+# 3) Target detection
+possible_targets = ["performance_category", "class", "target", "label", "grade_category", "performance"]
+target = next((c for c in possible_targets if c in df.columns), None)
+if target is None:
+    nonnum = [c for c in df.columns if df[c].dtype == "object"]
+    target = nonnum[-1] if nonnum else df.columns[-1]
+print("Target column:", target)
+
+# 4) Types (exclude target from numeric)
+numeric_cols = [c for c in df.select_dtypes(include=[np.number]).columns if c != target]
+categorical_cols = [c for c in df.columns if c not in numeric_cols + [target]]
+print("\nNumeric Columns:", numeric_cols)
+print("Categorical Columns:", categorical_cols)
+
+# 5) Descriptives
+if numeric_cols:
+    print("\n NUMERIC SUMMARY ")
+    print(df[numeric_cols].describe().T)
+
+print("\n CATEGORICAL SUMMARY (top 10)")
+for col in categorical_cols:
+    vc = df[col].astype(str).value_counts(dropna=False)
+    print(f"\n{col} ({len(vc)} unique):")
+    print(vc.head(10))
+
+# 6) Target distribution (count + %)
+vc = df[target].astype(str).value_counts(dropna=False)
+vp = (vc / vc.sum() * 100).round(2)
+print("\nTarget counts:\n", vc)
+print("\nTarget percent:\n", vp)
+
+fig, ax = plt.subplots(1, 2, figsize=(10,4))
+ax[0].bar(vc.index, vc.values); ax[0].set_title("Target Counts")
+ax[0].set_xlabel(target); ax[0].set_ylabel("Count"); ax[0].tick_params(axis='x', rotation=45)
+ax[1].bar(vp.index, vp.values); ax[1].set_title("Target Percent")
+ax[1].set_xlabel(target); ax[1].set_ylabel("%"); ax[1].tick_params(axis='x', rotation=45)
+plt.tight_layout(); plt.show()
+
+# 7) Missing heatmap + bar
+plt.figure(figsize=(10,5))
+sns.heatmap(df.isnull(), cbar=False, cmap="YlGnBu")
+plt.title("Missing Values Heatmap"); plt.tight_layout(); plt.show()
+
+miss_counts = df.isnull().sum().sort_values(ascending=False)
+if miss_counts.iloc[0] > 0:
+    plt.figure(figsize=(10,4))
+    miss_counts[miss_counts > 0].plot(kind="bar")
+    plt.title("Missing Values by Column"); plt.ylabel("Missing")
+    plt.tight_layout(); plt.show()
+
+# 8) Correlation (numeric)
+if len(numeric_cols) > 1:
+    try:
+        corr = df[numeric_cols].corr(numeric_only=True)
+    except TypeError:
+        corr = df[numeric_cols].corr()
+    plt.figure(figsize=(min(1.2*len(numeric_cols), 12), min(1.0*len(numeric_cols), 10)))
+    sns.heatmap(corr, cmap="coolwarm", annot=(len(numeric_cols) <= 10), fmt=".2f", linewidths=0.3)
+    plt.title("Correlation Matrix (Numeric)"); plt.tight_layout(); plt.show()
+
+# 9) Boxplots: numeric vs target
+for col in numeric_cols:
+    try:
+        plt.figure(figsize=(6,4))
+        sns.boxplot(x=df[target].astype(str), y=df[col], palette="pastel")
+        plt.title(f"{col} by {target}"); plt.xlabel(target)
+        plt.tight_layout(); plt.show()
+    except Exception as e:
+        print(f"Boxplot for {col} skipped:", e)
+
+# 10) Categorical crosstab vs target
+for col in categorical_cols:
+    try:
+        if df[col].nunique(dropna=False) > 40:
+            print(f"{col}: high cardinality, skipping bar crosstab.")
+            continue
+        ct = pd.crosstab(df[col].astype(str), df[target].astype(str))
+        ax = ct.plot(kind="bar", figsize=(7,4))
+        ax.set_title(f"{col} distribution by {target}")
+        ax.set_xlabel(col); ax.set_ylabel("Count")
+        plt.xticks(rotation=45); plt.tight_layout(); plt.show()
+    except Exception as e:
+        print(f"{col} crosstab skipped:", e)
