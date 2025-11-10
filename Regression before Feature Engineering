@@ -1,0 +1,205 @@
+# Regression: Traditional (LR), Deep (ANN), Hybrid (LR+ANN)
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+# Deep learning
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+
+# 1) Config
+
+CSV_PATH = r"C:\Data\student_habits_performance.csv" 
+TARGET   = "exam_score"                
+
+RANDOM_STATE = 42            #random seed to make sure results are reproducible
+TEST_SIZE    = 0.2           #20% of the dataset will be set aside as a test set
+VAL_SIZE     = 0.2           #20% of the training data will be used as a validation set
+                             #validation split *from the training portion* (for hybrid weight) 
+EPOCHS       = 200           #loop 200 times
+BATCH_SIZE   = 32        
+PATIENCE     = 20            #early stopping (to prevent overfitting)
+
+# 2) Load data
+df = pd.read_csv(CSV_PATH)
+
+if TARGET not in df.columns:
+    raise ValueError(f"TARGET column '{TARGET}' not found. Columns: {list(df.columns)}")
+
+# Separate features/target
+y = df[TARGET].astype(float)
+X = df.drop(columns=[TARGET])
+
+# Identify feature types
+cat_cols = [c for c in X.columns if X[c].dtype == 'object' or str(X[c].dtype).startswith('category')]  #Loops through all columns in dataset
+num_cols = [c for c in X.columns if c not in cat_cols]  #takes all columns in X that are not in cat_cols
+
+# 3) Train/Validation/Test split
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE
+)
+
+# We'll carve out a validation set from the training set for tuning the hybrid weight
+X_fit, X_val, y_fit, y_val = train_test_split(
+    X_train, y_train, test_size=VAL_SIZE, random_state=RANDOM_STATE
+)
+#tuning means adjusting the model’s parameters or settings to make it perform better to reduce errors and improve accuracy.
+
+# 4) Preprocessing
+# change categorical to numerical
+# OneHotEncoder -> dense output so we can feed it to both LR and ANN easily
+num_pipe = Pipeline(steps=[
+    ("impute", SimpleImputer(strategy="median")),  #fills missing numeric values with the median of that column.
+    ("scale", StandardScaler())                    #standardizes the data by subtracting the mean and dividing by the standard deviation.
+])
+
+cat_pipe = Pipeline(steps=[
+    ("impute", SimpleImputer(strategy="most_frequent")),              #fills missing text values with the most frequent value in that column.
+    ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False))  #converts categorical labels into binary columns like 0 and 1
+])
+
+preprocessor = ColumnTransformer(    #applies different preprocessing steps to different column types
+    transformers=[
+        ("num", num_pipe, num_cols),
+        ("cat", cat_pipe, cat_cols),
+    ],
+    remainder="drop",               #drops any columns not listed
+    verbose_feature_names_out=False #keeps simpler feature names after transformation
+)
+
+# Fit preprocessor on training subset (X_fit) to avoid peeking at validation/test
+preprocessor.fit(X_fit)
+
+# Transform splits to dense arrays
+X_fit_t = preprocessor.transform(X_fit)
+X_val_t = preprocessor.transform(X_val)
+X_train_t = preprocessor.transform(X_train)   # (fit+val) used for final refits if desired
+X_test_t = preprocessor.transform(X_test)
+
+input_dim = X_train_t.shape[1]
+
+# 5) Traditional: Linear Regression
+lr = LinearRegression()
+lr.fit(X_fit_t, y_fit)
+
+lr_val_pred  = lr.predict(X_val_t) #make predictions for validation and test sets
+lr_test_pred = lr.predict(X_test_t)
+
+# 6) Deep Learning: ANN (Artificial Neural Network)
+def build_ann(input_dim: int):   #the number of features in your input data
+    model = Sequential([         #means the model is built layer-by-layer
+        Dense(128, activation="relu", input_shape=(input_dim,)),  #dence means fully connected layer, defines how many input features go into the network.
+        Dropout(0.10),
+        Dense(64, activation="relu"),   #relu = Rectified linear unit, helps the model learn non-linear patterns.
+        Dense(32, activation="relu"),   #activation function that helps the model learn complex patterns by keeping +value and turning -1 to 0
+        Dense(1)  # regression output layer with 1 neuron
+    ])
+    model.compile(optimizer="adam", loss="mse", metrics=["mae"]) #daptive gradient method ,Mean Squared Error, Mean Absolute Error
+    return model
+
+ann = build_ann(input_dim)   #builds the model using the given number of input features
+early_stop = EarlyStopping(monitor="val_loss", patience=PATIENCE, restore_best_weights=True)  #stops training early if validation loss stops improving
+                                                                                              #patience = number of epochs to wait before stopping
+history = ann.fit(
+    X_fit_t, y_fit,                            #training data
+    validation_data=(X_val_t, y_val),          #separate data for validation during training
+    epochs=EPOCHS,                             #max number of times the model sees all the training data
+    batch_size=BATCH_SIZE,                     #how many samples per update step
+    verbose=0,                                 #hides training logs
+    callbacks=[early_stop]                     #applies early stopping automatically
+)
+
+#make predictions for validation and test sets
+ann_val_pred  = ann.predict(X_val_t, verbose=0).flatten()  #flatten mean converts 2D output arrays to 1D array
+ann_test_pred = ann.predict(X_test_t, verbose=0).flatten()
+
+# 7) Hybrid: optimize blend weight alpha on validation set
+# hybrid_pred = alpha * lr_pred + (1 - alpha) * ann_pred
+alphas = np.linspace(0, 1, 101)    #each value of alpha represents how much weight to give to the LR model, generate 101 valus between 0 and 1
+best_alpha, best_mse = None, np.inf #means infinity
+for a in alphas:  #loop
+    blend = a * lr_val_pred + (1 - a) * ann_val_pred
+    mse = mean_squared_error(y_val, blend)
+    if mse < best_mse:  #if the current blend’s MSE is smaller (better) than the previous best one
+        best_mse, best_alpha = mse, a
+
+hyb_test_pred = best_alpha * lr_test_pred + (1 - best_alpha) * ann_test_pred
+
+# 8) Metrics helper
+
+def metrics(y_true, y_pred):
+    mae = mean_absolute_error(y_true, y_pred)
+    # Version-safe RMSE (old sklearn lacks `squared` kwarg)
+    try:
+        rmse = mean_squared_error(y_true, y_pred, squared=False)
+    except TypeError:
+        rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    r2  = r2_score(y_true, y_pred)
+    return mae, rmse, r2
+
+lr_mae,  lr_rmse,  lr_r2  = metrics(y_test, lr_test_pred)
+ann_mae, ann_rmse, ann_r2 = metrics(y_test, ann_test_pred)
+hyb_mae, hyb_rmse, hyb_r2 = metrics(y_test, hyb_test_pred)
+
+print("Test Metrics ")
+print(f"Linear Regression   -> MAE: {lr_mae:.4f} | RMSE: {lr_rmse:.4f} | R²: {lr_r2:.4f}")
+print(f"ANN (Deep Learning) -> MAE: {ann_mae:.4f} | RMSE: {ann_rmse:.4f} | R²: {ann_r2:.4f}")
+print(f"Hybrid (LR+ANN)     -> MAE: {hyb_mae:.4f} | RMSE: {hyb_rmse:.4f} | R²: {hyb_r2:.4f}")
+print(f"Chosen alpha (weight on LR) for hybrid: {best_alpha:.2f}")
+
+# 9) Plots
+# 9a. ANN training curve
+plt.figure(figsize=(7,5))
+plt.plot(history.history["loss"], label="train_loss")
+plt.plot(history.history["val_loss"], label="val_loss")
+plt.xlabel("Epoch")       #number of training iteration
+plt.ylabel("MSE loss")    #error between predicted and actual values, measured by Mean
+plt.title("ANN Training Curve")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# parity plot =#mean predicted values with the actual (true) values
+def parity_plot(y_true, y_pred, title):
+    plt.figure(figsize=(6.5,6))
+    plt.scatter(y_true, y_pred, alpha=0.7)
+    mn, mx = np.min(y_true), np.max(y_true)
+    plt.plot([mn, mx], [mn, mx], color="red")
+    plt.xlabel("Actual")
+    plt.ylabel("Predicted")
+    plt.title(title)
+    plt.tight_layout()
+    plt.show()
+
+# residuals plot    =mean check whether the model’s errors are random or biased
+def residuals_plot(y_true, y_pred, title):
+    residuals = y_true - y_pred
+    plt.figure(figsize=(7,5))
+    plt.scatter(y_pred, residuals, alpha=0.7)
+    plt.axhline(0, color='red')
+    plt.xlabel("Predicted")
+    plt.ylabel("Residual (Actual - Predicted)")
+    plt.title(title)
+    plt.tight_layout()
+    plt.show()
+
+# Parity & residuals for all three
+parity_plot(y_test, lr_test_pred,  "Parity Plot — Linear Regression")
+residuals_plot(y_test, lr_test_pred, "Residuals — Linear Regression")
+
+parity_plot(y_test, ann_test_pred, "Parity Plot — ANN")
+residuals_plot(y_test, ann_test_pred, "Residuals — ANN")
+
+parity_plot(y_test, hyb_test_pred, "Parity Plot — Hybrid (LR+ANN)")
+residuals_plot(y_test, hyb_test_pred, "Residuals — Hybrid (LR+ANN)")
