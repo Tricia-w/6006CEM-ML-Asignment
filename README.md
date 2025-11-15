@@ -1,4 +1,4 @@
-Regression and Classification Problem
+Regression and Classification Problem (Student Performance)
 Using Machine Learning
 
 There are files from jupyter for regression and classification and the implementation is for chapter 2 
